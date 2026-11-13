@@ -3,6 +3,7 @@ package com.example.payscandemo
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.util.Size
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -14,6 +15,9 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.*
@@ -35,6 +39,8 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.util.concurrent.Executors
 
+
+private val ANALYSIS_SIZE = Size(1280, 720)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -79,6 +85,8 @@ fun CameraFlashlightApp() {
     }
 }
 
+private val aspectStrategy = AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
+
 @OptIn(ExperimentalGetImage::class)
 @Composable
 fun CameraWithTorchAndOcrScreen() {
@@ -118,8 +126,20 @@ fun CameraWithTorchAndOcrScreen() {
                         it.surfaceProvider = previewView.surfaceProvider
                     }
 
+
+
                     // Drop frames while ML Kit is busy so the camera preview never lags
                     val imageAnalysis = ImageAnalysis.Builder()
+                        .setResolutionSelector(
+                            ResolutionSelector.Builder()
+                                .setAspectRatioStrategy(aspectStrategy)
+                                .setResolutionStrategy(
+                                    ResolutionStrategy(
+                                        ANALYSIS_SIZE,
+                                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                                    )
+                                ).build()
+                        )
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .build()
                         .also { analysis ->
