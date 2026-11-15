@@ -1,8 +1,14 @@
 package com.example.payscandemo
 
 import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Size
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -25,14 +31,19 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
@@ -52,24 +63,43 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun Context.findActivity(): Activity? {
+    var ctx = this
+    while (ctx is ContextWrapper) {
+        if (ctx is Activity) return ctx
+        ctx = ctx.baseContext
+    }
+    return null
+}
+
 @Composable
 fun CameraFlashlightApp() {
     val context = LocalContext.current
-    var hasCameraPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
-                    PackageManager.PERMISSION_GRANTED
-        )
-    }
+    val activity = remember(context) { context.findActivity() }
+
+    fun isGranted() = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+
+    var hasCameraPermission by remember { mutableStateOf(isGranted()) }
+    var permanentlyDenied by remember { mutableStateOf(false) }
+    var askedOnce by rememberSaveable { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         hasCameraPermission = granted
+        permanentlyDenied = !granted && activity != null &&
+                !ActivityCompat.shouldShowRequestPermissionRationale(activity, Manifest.permission.CAMERA)
+    }
+
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        hasCameraPermission = isGranted()
+        if (hasCameraPermission) permanentlyDenied = false
     }
 
     LaunchedEffect(Unit) {
-        if (!hasCameraPermission) {
+        if (!hasCameraPermission && !askedOnce) {
+            askedOnce = true
             permissionLauncher.launch(Manifest.permission.CAMERA)
         }
     }
@@ -77,9 +107,35 @@ fun CameraFlashlightApp() {
     if (hasCameraPermission) {
         CameraWithTorchAndOcrScreen()
     } else {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
-                Text("Grant Camera Permission")
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = if (permanentlyDenied) {
+                    "Camera access is turned off. Enable it in Settings to scan text."
+                } else {
+                    "Camera access is needed to scan text."
+                },
+                textAlign = TextAlign.Center,
+                style = MaterialTheme.typography.bodyLarge
+            )
+            Spacer(Modifier.height(16.dp))
+            if (permanentlyDenied) {
+                Button(onClick = {
+                    context.startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.fromParts("package", context.packageName, null)
+                        }
+                    )
+                }) { Text("Open Settings") }
+            } else {
+                Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
+                    Text("Grant Camera Permission")
+                }
             }
         }
     }
