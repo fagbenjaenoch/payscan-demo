@@ -23,6 +23,7 @@ import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
@@ -229,15 +230,21 @@ class OcrAnalyzer(
                 .addOnSuccessListener { visionText ->
                     if (released.get()) return@addOnSuccessListener
                     val size = viewSize()
-                    val blocks = visionText.textBlocks
-                        .filter { it.text.isNotBlank() }
-                        .map { block ->
-                            OcrBlock(
-                                text = block.text.trim(),
-                                box = block.boundingBox?.let { mapToView(it, imageW, imageH, size) }
-                            )
+                    val textBlocks = visionText.textBlocks
+                    if (textBlocks.isEmpty()) return@addOnSuccessListener
+
+                    val blocks = ArrayList<OcrBlock>(textBlocks.size)
+                    for (i in 0 until textBlocks.size) {
+                        val block = textBlocks[i]
+                        val text = block.text
+                        if (text.isNotBlank()) {
+                            val box = block.boundingBox?.let { mapToView(it, imageW, imageH, size) }
+                            blocks.add(OcrBlock(text.trim(), box))
                         }
-                    onResult(blocks)
+                    }
+                    if (blocks.isNotEmpty()) {
+                        onResult(blocks)
+                    }
                 }
                 .addOnCompleteListener { imageProxy.close() }
         } catch (_: Exception) {
@@ -294,6 +301,14 @@ private fun buildImageAnalysis(): ImageAnalysis =
         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
         .build()
 
+private fun buildImageCapture(): ImageCapture =
+    ImageCapture.Builder()
+        .setResolutionSelector(
+            ResolutionSelector.Builder().setAspectRatioStrategy(aspectStrategy).build()
+        )
+        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+        .build()
+
 // ---------------------------------------------------------------------------
 // Main screen
 // ---------------------------------------------------------------------------
@@ -315,10 +330,10 @@ fun CameraWithTorchAndOcrScreen() {
     var selectedIndex by remember { mutableStateOf<Int?>(null) }
     var previewSize by remember { mutableStateOf(IntSize.Zero) }
 
-    // COMPATIBLE mode (TextureView) is required so previewView.bitmap works for the freeze frame.
+    // PERFORMANCE mode (SurfaceView) is used for maximum rendering efficiency & low battery usage.
     val previewView = remember {
         PreviewView(context).apply {
-            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
             scaleType = PreviewView.ScaleType.FILL_CENTER
         }
     }
@@ -341,6 +356,7 @@ fun CameraWithTorchAndOcrScreen() {
             }
         )
         val imageAnalysis = buildImageAnalysis().also { it.setAnalyzer(executor, analyzer) }
+        val imageCapture = buildImageCapture()
 
         val providerFuture = ProcessCameraProvider.getInstance(context)
         var provider: ProcessCameraProvider? = null
@@ -355,7 +371,8 @@ fun CameraWithTorchAndOcrScreen() {
                 lifecycleOwner,
                 CameraSelector.DEFAULT_BACK_CAMERA,
                 buildPreview(previewView),
-                imageAnalysis
+                imageAnalysis,
+                imageCapture
             )
         }, ContextCompat.getMainExecutor(context))
 
