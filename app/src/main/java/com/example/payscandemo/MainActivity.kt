@@ -2,11 +2,13 @@ package com.example.payscandemo
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.Settings
@@ -28,6 +30,9 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -37,11 +42,17 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -54,9 +65,13 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
+import kotlin.math.roundToInt
+import kotlin.time.Duration.Companion.milliseconds
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -70,6 +85,7 @@ private const val STALE_TEXT_MS = 1_500L
 
 /** Target analysis resolution. Higher than CameraX's 640x480 default so small print is readable. */
 private val ANALYSIS_SIZE = Size(1280, 720)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -80,6 +96,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Permission handling
+// ---------------------------------------------------------------------------
 
 private fun Context.findActivity(): Activity? {
     var ctx = this
@@ -106,10 +126,14 @@ fun CameraFlashlightApp() {
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         hasCameraPermission = granted
+        // After a denial, if Android says we shouldn't show a rationale, the user
+        // chose "Don't ask again" (or the system blocked the prompt), so the
+        // dialog will never appear again and we must send them to Settings.
         permanentlyDenied = !granted && activity != null &&
                 !ActivityCompat.shouldShowRequestPermissionRationale(activity, Manifest.permission.CAMERA)
     }
 
+    // Re-check when returning from system Settings.
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         hasCameraPermission = isGranted()
         if (hasCameraPermission) permanentlyDenied = false
@@ -158,8 +182,6 @@ fun CameraFlashlightApp() {
         }
     }
 }
-
-private val aspectStrategy = AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
 
 // ---------------------------------------------------------------------------
 // OCR analyzer (kept out of the composable so it stays small and testable)
@@ -243,6 +265,10 @@ class OcrAnalyzer(
 // Camera use case builders
 // ---------------------------------------------------------------------------
 
+// Same aspect ratio on Preview and ImageAnalysis so both see the same field of view,
+// which keeps the bounding boxes aligned with what's on screen.
+private val aspectStrategy = AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
+
 private fun buildPreview(previewView: PreviewView): Preview =
     Preview.Builder()
         .setResolutionSelector(
@@ -268,33 +294,49 @@ private fun buildImageAnalysis(): ImageAnalysis =
         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
         .build()
 
+// ---------------------------------------------------------------------------
+// Main screen
+// ---------------------------------------------------------------------------
+
 @Composable
 fun CameraWithTorchAndOcrScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val clipboardManager = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
+    val density = LocalDensity.current
+    val scope = rememberCoroutineScope()
 
     var camera by remember { mutableStateOf<Camera?>(null) }
-    var isTorchOn by remember { mutableStateOf(false) }
-    var detectedText by remember { mutableStateOf("") }
+    var isTorchOn by rememberSaveable { mutableStateOf(false) } // survives rotation
+    var blocks by remember { mutableStateOf<List<OcrBlock>>(emptyList()) }
+    var lastTextAt by remember { mutableLongStateOf(0L) }
+    var isFrozen by remember { mutableStateOf(false) }
+    var frozenFrame by remember { mutableStateOf<ImageBitmap?>(null) }
+    var selectedIndex by remember { mutableStateOf<Int?>(null) }
     var previewSize by remember { mutableStateOf(IntSize.Zero) }
 
+    // COMPATIBLE mode (TextureView) is required so previewView.bitmap works for the freeze frame.
     val previewView = remember {
         PreviewView(context).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
             scaleType = PreviewView.ScaleType.FILL_CENTER
         }
     }
 
+    // Camera + analyzer lifecycle in one place so teardown order is deterministic:
+    // stop the analyzer -> unbind camera -> shut down executor -> close recognizer.
     DisposableEffect(lifecycleOwner) {
         val executor = Executors.newSingleThreadExecutor()
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         val analyzer = OcrAnalyzer(
             recognizer = recognizer,
-            isPaused = { false },
+            isPaused = { isFrozen },
             viewSize = { previewSize },
             onResult = { result ->
-                if (result.isNotEmpty()) {
-                    detectedText = result.joinToString("\n") { it.text }
+                // Ignore empty results (handled by the stale timer) and late results after freezing.
+                if (!isFrozen && result.isNotEmpty()) {
+                    blocks = result
+                    lastTextAt = SystemClock.elapsedRealtime()
                 }
             }
         )
@@ -328,6 +370,50 @@ fun CameraWithTorchAndOcrScreen() {
         }
     }
 
+    // Torch: re-applied whenever the camera rebinds or the saved state changes.
+    LaunchedEffect(camera, isTorchOn) {
+        camera?.takeIf { it.cameraInfo.hasFlashUnit() }
+            ?.cameraControl?.enableTorch(isTorchOn)
+    }
+
+    // Clear stale text after the camera points away from it.
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(500.milliseconds)
+            if (!isFrozen && blocks.isNotEmpty() &&
+                SystemClock.elapsedRealtime() - lastTextAt > STALE_TEXT_MS
+            ) {
+                blocks = emptyList()
+            }
+        }
+    }
+
+    fun toggleFreeze() {
+        if (isFrozen) {
+            isFrozen = false
+            frozenFrame = null
+            selectedIndex = null
+            blocks = emptyList()
+        } else if (blocks.isNotEmpty()) {
+            frozenFrame = previewView.bitmap?.asImageBitmap()
+            isFrozen = true
+        }
+    }
+
+    fun copyText(text: String) {
+        scope.launch {
+            clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("Recognized text", text)))
+            // Android 13+ shows its own "Copied" confirmation, so only toast on older versions.
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2) {
+                Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    val selectedBlock = selectedIndex?.let { blocks.getOrNull(it) }
+    val displayText = selectedBlock?.text ?: blocks.joinToString("\n") { it.text }
+    val hasFlash = camera?.cameraInfo?.hasFlashUnit() == true
+
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
             modifier = Modifier
@@ -336,56 +422,101 @@ fun CameraWithTorchAndOcrScreen() {
             factory = { previewView }
         )
 
+        // Frozen snapshot covers the live preview so boxes stay aligned with the image.
+        frozenFrame?.let { frame ->
+            Image(
+                bitmap = frame,
+                contentDescription = null,
+                contentScale = ContentScale.FillBounds,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+
+        // Bounding boxes; tappable only while frozen.
+        blocks.forEachIndexed { index, block ->
+            val r = block.box ?: return@forEachIndexed
+            val selected = index == selectedIndex
+            Box(
+                modifier = Modifier
+                    .offset { IntOffset(r.left.roundToInt(), r.top.roundToInt()) }
+                    .size(
+                        width = with(density) { r.width.toDp() },
+                        height = with(density) { r.height.toDp() }
+                    )
+                    .border(
+                        width = if (selected) 3.dp else 1.5.dp,
+                        color = if (selected) Color.Yellow else Color.White.copy(alpha = 0.8f)
+                    )
+                    .then(
+                        if (isFrozen) {
+                            Modifier.clickable { selectedIndex = if (selected) null else index }
+                        } else {
+                            Modifier
+                        }
+                    )
+            )
+        }
+
+        // Bottom overlay: detected text + actions
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
+                .navigationBarsPadding()
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            if (detectedText.isNotEmpty()) {
-                Surface(
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
-                    shape = MaterialTheme.shapes.medium,
+            Surface(
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 150.dp)
+            ) {
+                Text(
+                    text = when {
+                        displayText.isNotEmpty() -> displayText
+                        else -> "Point the camera at some text"
+                    },
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 150.dp)
-                ) {
-                    Text(
-                        text = detectedText,
-                        modifier = Modifier
-                            .padding(12.dp)
-                            .verticalScroll(rememberScrollState()),
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                }
+                        .padding(12.dp)
+                        .verticalScroll(rememberScrollState()),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+
+            if (isFrozen) {
+                Text(
+                    text = "Tap a box to copy just that block",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White
+                )
             }
 
             Row(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Button(
-                    onClick = {
-                        val cam = camera ?: return@Button
-                        if (cam.cameraInfo.hasFlashUnit()) {
-                            isTorchOn = !isTorchOn
-                            cam.cameraControl.enableTorch(isTorchOn)
-                        }
+                // Hidden entirely on devices without a flash unit
+                if (hasFlash) {
+                    Button(onClick = { isTorchOn = !isTorchOn }) {
+                        Text(if (isTorchOn) "Flash Off" else "Flash On")
                     }
-                ) {
-                    Text(if (isTorchOn) "Flash Off" else "Flash On")
                 }
 
                 Button(
-                    enabled = detectedText.isNotEmpty(),
-                    onClick = {
-                        clipboardManager.setText(AnnotatedString(detectedText))
-                        Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
-                    }
+                    enabled = isFrozen || blocks.isNotEmpty(),
+                    onClick = { toggleFreeze() }
                 ) {
-                    Text("Copy Text")
+                    Text(if (isFrozen) "Resume" else "Freeze")
+                }
+
+                Button(
+                    enabled = displayText.isNotEmpty(),
+                    onClick = { copyText(displayText) }
+                ) {
+                    Text(if (selectedBlock != null) "Copy Block" else "Copy All")
                 }
             }
         }
