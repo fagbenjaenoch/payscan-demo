@@ -32,10 +32,12 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -52,6 +54,8 @@ import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -127,14 +131,10 @@ fun CameraFlashlightApp() {
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         hasCameraPermission = granted
-        // After a denial, if Android says we shouldn't show a rationale, the user
-        // chose "Don't ask again" (or the system blocked the prompt), so the
-        // dialog will never appear again and we must send them to Settings.
         permanentlyDenied = !granted && activity != null &&
                 !ActivityCompat.shouldShowRequestPermissionRationale(activity, Manifest.permission.CAMERA)
     }
 
-    // Re-check when returning from system Settings.
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         hasCameraPermission = isGranted()
         if (hasCameraPermission) permanentlyDenied = false
@@ -185,18 +185,25 @@ fun CameraFlashlightApp() {
 }
 
 // ---------------------------------------------------------------------------
-// OCR analyzer (kept out of the composable so it stays small and testable)
+// OCR analyzer (delegates NUBAN filtering to NubanFilter)
 // ---------------------------------------------------------------------------
 
 /** One recognized text block. [box] is in preview-view pixels, or null if it couldn't be mapped. */
 data class OcrBlock(val text: String, val box: Rect?)
 
+/** Combined frame output containing raw OCR blocks and any confirmed NUBAN candidate. */
+data class OcrScanResult(
+    val blocks: List<OcrBlock>,
+    val nuban: NubanCandidate?
+)
+
 class OcrAnalyzer(
     private val recognizer: TextRecognizer,
+    private val nubanFilter: NubanFilter,
     private val isPaused: () -> Boolean,
     private val viewSize: () -> IntSize,
     /** Always invoked on the main thread. */
-    private val onResult: (List<OcrBlock>) -> Unit
+    private val onResult: (OcrScanResult) -> Unit
 ) : ImageAnalysis.Analyzer {
 
     private val released = AtomicBoolean(false)
@@ -230,9 +237,9 @@ class OcrAnalyzer(
                 .addOnSuccessListener { visionText ->
                     if (released.get()) return@addOnSuccessListener
                     val size = viewSize()
-                    val textBlocks = visionText.textBlocks
-                    if (textBlocks.isEmpty()) return@addOnSuccessListener
+                    val confirmedNuban = nubanFilter.filter(visionText.text)
 
+                    val textBlocks = visionText.textBlocks
                     val blocks = ArrayList<OcrBlock>(textBlocks.size)
                     for (i in 0 until textBlocks.size) {
                         val block = textBlocks[i]
@@ -242,8 +249,9 @@ class OcrAnalyzer(
                             blocks.add(OcrBlock(text.trim(), box))
                         }
                     }
-                    if (blocks.isNotEmpty()) {
-                        onResult(blocks)
+
+                    if (blocks.isNotEmpty() || confirmedNuban != null) {
+                        onResult(OcrScanResult(blocks, confirmedNuban))
                     }
                 }
                 .addOnCompleteListener { imageProxy.close() }
@@ -272,8 +280,6 @@ class OcrAnalyzer(
 // Camera use case builders
 // ---------------------------------------------------------------------------
 
-// Same aspect ratio on Preview and ImageAnalysis so both see the same field of view,
-// which keeps the bounding boxes aligned with what's on screen.
 private val aspectStrategy = AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
 
 private fun buildPreview(previewView: PreviewView): Preview =
@@ -297,7 +303,6 @@ private fun buildImageAnalysis(): ImageAnalysis =
                 )
                 .build()
         )
-        // Drop frames while ML Kit is busy so the preview never lags
         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
         .build()
 
@@ -321,16 +326,17 @@ fun CameraWithTorchAndOcrScreen() {
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
 
+    val nubanFilter = remember { NubanFilter() }
     var camera by remember { mutableStateOf<Camera?>(null) }
-    var isTorchOn by rememberSaveable { mutableStateOf(false) } // survives rotation
+    var isTorchOn by rememberSaveable { mutableStateOf(false) }
     var blocks by remember { mutableStateOf<List<OcrBlock>>(emptyList()) }
+    var detectedNuban by remember { mutableStateOf<NubanCandidate?>(null) }
     var lastTextAt by remember { mutableLongStateOf(0L) }
     var isFrozen by remember { mutableStateOf(false) }
     var frozenFrame by remember { mutableStateOf<ImageBitmap?>(null) }
     var selectedIndex by remember { mutableStateOf<Int?>(null) }
     var previewSize by remember { mutableStateOf(IntSize.Zero) }
 
-    // PERFORMANCE mode (SurfaceView) is used for maximum rendering efficiency & low battery usage.
     val previewView = remember {
         PreviewView(context).apply {
             implementationMode = PreviewView.ImplementationMode.PERFORMANCE
@@ -338,20 +344,24 @@ fun CameraWithTorchAndOcrScreen() {
         }
     }
 
-    // Camera + analyzer lifecycle in one place so teardown order is deterministic:
-    // stop the analyzer -> unbind camera -> shut down executor -> close recognizer.
     DisposableEffect(lifecycleOwner) {
         val executor = Executors.newSingleThreadExecutor()
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         val analyzer = OcrAnalyzer(
             recognizer = recognizer,
+            nubanFilter = nubanFilter,
             isPaused = { isFrozen },
             viewSize = { previewSize },
             onResult = { result ->
-                // Ignore empty results (handled by the stale timer) and late results after freezing.
-                if (!isFrozen && result.isNotEmpty()) {
-                    blocks = result
-                    lastTextAt = SystemClock.elapsedRealtime()
+                if (!isFrozen) {
+                    if (result.blocks.isNotEmpty()) {
+                        blocks = result.blocks
+                        lastTextAt = SystemClock.elapsedRealtime()
+                    }
+                    if (result.nuban != null) {
+                        detectedNuban = result.nuban
+                        lastTextAt = SystemClock.elapsedRealtime()
+                    }
                 }
             }
         )
@@ -393,14 +403,16 @@ fun CameraWithTorchAndOcrScreen() {
             ?.cameraControl?.enableTorch(isTorchOn)
     }
 
-    // Clear stale text after the camera points away from it.
+    // Clear stale text and NUBAN votes after the camera points away.
     LaunchedEffect(Unit) {
         while (true) {
             delay(500.milliseconds)
-            if (!isFrozen && blocks.isNotEmpty() &&
+            if (!isFrozen && (blocks.isNotEmpty() || detectedNuban != null) &&
                 SystemClock.elapsedRealtime() - lastTextAt > STALE_TEXT_MS
             ) {
                 blocks = emptyList()
+                detectedNuban = null
+                nubanFilter.reset()
             }
         }
     }
@@ -411,16 +423,17 @@ fun CameraWithTorchAndOcrScreen() {
             frozenFrame = null
             selectedIndex = null
             blocks = emptyList()
-        } else if (blocks.isNotEmpty()) {
+            detectedNuban = null
+            nubanFilter.reset()
+        } else if (blocks.isNotEmpty() || detectedNuban != null) {
             frozenFrame = previewView.bitmap?.asImageBitmap()
             isFrozen = true
         }
     }
 
-    fun copyText(text: String) {
+    fun copyText(label: String, text: String) {
         scope.launch {
-            clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("Recognized text", text)))
-            // Android 13+ shows its own "Copied" confirmation, so only toast on older versions.
+            clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(label, text)))
             if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2) {
                 Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
             }
@@ -449,10 +462,16 @@ fun CameraWithTorchAndOcrScreen() {
             )
         }
 
-        // Bounding boxes; tappable only while frozen.
+        // Bounding boxes; NUBAN-matching blocks highlight in green, tapped blocks in yellow.
         blocks.forEachIndexed { index, block ->
             val r = block.box ?: return@forEachIndexed
             val selected = index == selectedIndex
+            val matchesNuban = detectedNuban?.let { nubanFilter.matchesBlock(block.text, it) } == true
+            val borderColor = when {
+                selected -> Color.Yellow
+                matchesNuban -> Color(0xFF00E676)
+                else -> Color.White.copy(alpha = 0.8f)
+            }
             Box(
                 modifier = Modifier
                     .offset { IntOffset(r.left.roundToInt(), r.top.roundToInt()) }
@@ -461,8 +480,8 @@ fun CameraWithTorchAndOcrScreen() {
                         height = with(density) { r.height.toDp() }
                     )
                     .border(
-                        width = if (selected) 3.dp else 1.5.dp,
-                        color = if (selected) Color.Yellow else Color.White.copy(alpha = 0.8f)
+                        width = if (selected || matchesNuban) 3.dp else 1.5.dp,
+                        color = borderColor
                     )
                     .then(
                         if (isFrozen) {
@@ -474,7 +493,7 @@ fun CameraWithTorchAndOcrScreen() {
             )
         }
 
-        // Bottom overlay: detected text + actions
+        // Bottom overlay: detected NUBAN card + raw OCR text + actions
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -482,19 +501,26 @@ fun CameraWithTorchAndOcrScreen() {
                 .navigationBarsPadding()
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
+            detectedNuban?.let { candidate ->
+                NubanResultCard(
+                    candidate = candidate,
+                    onCopyAccount = { copyText("NUBAN account number", it) }
+                )
+            }
+
             Surface(
                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
                 shape = MaterialTheme.shapes.medium,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 150.dp)
+                    .heightIn(max = if (detectedNuban != null) 110.dp else 150.dp)
             ) {
                 Text(
                     text = when {
                         displayText.isNotEmpty() -> displayText
-                        else -> "Point the camera at some text"
+                        else -> "Point the camera at a bank account or text"
                     },
                     modifier = Modifier
                         .padding(12.dp)
@@ -515,7 +541,6 @@ fun CameraWithTorchAndOcrScreen() {
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Hidden entirely on devices without a flash unit
                 if (hasFlash) {
                     Button(onClick = { isTorchOn = !isTorchOn }) {
                         Text(if (isTorchOn) "Flash Off" else "Flash On")
@@ -523,7 +548,7 @@ fun CameraWithTorchAndOcrScreen() {
                 }
 
                 Button(
-                    enabled = isFrozen || blocks.isNotEmpty(),
+                    enabled = isFrozen || blocks.isNotEmpty() || detectedNuban != null,
                     onClick = { toggleFreeze() }
                 ) {
                     Text(if (isFrozen) "Resume" else "Freeze")
@@ -531,9 +556,91 @@ fun CameraWithTorchAndOcrScreen() {
 
                 Button(
                     enabled = displayText.isNotEmpty(),
-                    onClick = { copyText(displayText) }
+                    onClick = { copyText("Recognized text", displayText) }
                 ) {
                     Text(if (selectedBlock != null) "Copy Block" else "Copy All")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NubanResultCard(
+    candidate: NubanCandidate,
+    onCopyAccount: (String) -> Unit
+) {
+    val (badgeBg, badgeFg) = when (candidate.confidence) {
+        Confidence.HIGH -> Color(0xFF1B5E20) to Color(0xFFA5D6A7)
+        Confidence.MEDIUM -> Color(0xFFE65100) to Color(0xFFFFCC80)
+        Confidence.LOW -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
+    }
+
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.95f),
+        shape = MaterialTheme.shapes.medium,
+        tonalElevation = 4.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = candidate.bank?.let { "${it.name} (${it.code})" } ?: "Bank not detected",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = "${candidate.confidence.name} CONFIDENCE",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = badgeFg,
+                    modifier = Modifier
+                        .background(badgeBg, RoundedCornerShape(4.dp))
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = candidate.number,
+                    style = MaterialTheme.typography.headlineSmall.copy(
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    ),
+                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                )
+                Button(onClick = { onCopyAccount(candidate.number) }) {
+                    Text("Copy NUBAN")
+                }
+            }
+
+            candidate.suggestedFix?.let { fix ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Possible OCR typo → $fix",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedButton(onClick = { onCopyAccount(fix) }) {
+                        Text("Copy Fix")
+                    }
                 }
             }
         }
