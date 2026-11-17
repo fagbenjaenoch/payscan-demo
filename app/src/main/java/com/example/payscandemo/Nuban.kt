@@ -46,15 +46,21 @@ object BankDirectory {
         Bank("100", "SunTrust Bank", listOf("suntrust")),
     )
 
-    private val patterns: Map<Bank, List<Regex>> = banks.associateWith { bank ->
-        bank.aliases.map { Regex("\\b${Regex.escape(it)}\\b") }
+    // Pre-compiled case-insensitive patterns avoid per-frame text.lowercase() allocations.
+    private val patterns: List<Pair<Bank, List<Regex>>> = banks.map { bank ->
+        bank to bank.aliases.map { Regex("\\b${Regex.escape(it)}\\b", RegexOption.IGNORE_CASE) }
     }
 
     /** Returns a bank only if exactly one bank is mentioned; ambiguous or none -> null. */
     fun findIn(text: String): Bank? {
-        val t = text.lowercase()
-        return patterns.filter { (_, regexes) -> regexes.any { it.containsMatchIn(t) } }
-            .keys.singleOrNull()
+        var matched: Bank? = null
+        for ((bank, regexes) in patterns) {
+            if (regexes.any { it.containsMatchIn(text) }) {
+                if (matched != null) return null
+                matched = bank
+            }
+        }
+        return matched
     }
 }
 
@@ -68,34 +74,66 @@ object NubanValidator {
         '5' to "6", '6' to "058", '7' to "12", '8' to "0369", '9' to "48",
     )
 
-    fun checkDigit(bankCode: String, serial9: String): Int {
-        val digits = bankCode + serial9
+    // Precomputed weighted sum for each known 3-digit bank code.
+    private val BANK_PREFIX_SUMS: Map<String, Int> = BankDirectory.banks.associate { bank ->
+        bank.code to bankPrefixSum(bank.code)
+    }
+
+    private fun bankPrefixSum(bankCode: String): Int =
+        (bankCode[0] - '0') * 3 + (bankCode[1] - '0') * 7 + (bankCode[2] - '0') * 3
+
+    private fun serialSum(serial9OrAccount: String): Int {
         var sum = 0
-        for (i in digits.indices) sum += (digits[i] - '0') * SEEDS[i]
-        val r = 10 - (sum % 10)
+        for (i in 0 until 9) {
+            sum += (serial9OrAccount[i] - '0') * SEEDS[i + 3]
+        }
+        return sum
+    }
+
+    private fun checkDigitWithSerialSum(bankCode: String, sSum: Int): Int {
+        val prefix = BANK_PREFIX_SUMS[bankCode] ?: bankPrefixSum(bankCode)
+        val r = 10 - ((prefix + sSum) % 10)
         return if (r == 10) 0 else r
     }
+
+    fun checkDigit(bankCode: String, serial9: String): Int =
+        checkDigitWithSerialSum(bankCode, serialSum(serial9))
 
     fun isValid(bankCode: String, account: String): Boolean =
         bankCode.length == 3 &&
                 account.length == 10 &&
                 account.all(Char::isDigit) &&
-                checkDigit(bankCode, account.substring(0, 9)) == account[9] - '0'
+                checkDigitWithSerialSum(bankCode, serialSum(account)) == account[9] - '0'
 
     /** Banks for which this number is checksum-valid. Weak evidence on its own. */
-    fun banksPassing(account: String): List<Bank> =
-        BankDirectory.banks.filter { isValid(it.code, account) }
+    fun banksPassing(account: String): List<Bank> {
+        if (account.length != 10 || !account.all(Char::isDigit)) return emptyList()
+        val sSum = serialSum(account)
+        val targetCheck = account[9] - '0'
+        return BankDirectory.banks.filter { bank ->
+            checkDigitWithSerialSum(bank.code, sSum) == targetCheck
+        }
+    }
 
     /** If exactly one lookalike substitution makes the number valid for this bank, return it. */
     fun singleDigitFix(bankCode: String, account: String): String? {
-        val fixes = mutableSetOf<String>()
-        for (i in account.indices) {
-            for (alt in LOOKALIKES[account[i]].orEmpty()) {
-                val variant = account.substring(0, i) + alt + account.substring(i + 1)
-                if (isValid(bankCode, variant)) fixes += variant
+        if (bankCode.length != 3 || account.length != 10) return null
+        val chars = account.toCharArray()
+        var foundFix: String? = null
+        for (i in chars.indices) {
+            val orig = chars[i]
+            val alts = LOOKALIKES[orig] ?: continue
+            for (alt in alts) {
+                chars[i] = alt
+                val variant = String(chars)
+                if (isValid(bankCode, variant)) {
+                    if (foundFix != null && foundFix != variant) return null
+                    foundFix = variant
+                }
             }
+            chars[i] = orig
         }
-        return fixes.singleOrNull()
+        return foundFix
     }
 }
 
@@ -120,10 +158,31 @@ object NubanExtractor {
         }
     }
 
+    private fun hasAtMostTwoDistinctChars(s: String): Boolean {
+        var first = '\u0000'
+        var second = '\u0000'
+        var count = 0
+        for (ch in s) {
+            if (count == 0) {
+                first = ch
+                count = 1
+            } else if (ch != first) {
+                if (count == 1) {
+                    second = ch
+                    count = 2
+                } else if (ch != second) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
     fun extract(frameText: String): List<NubanCandidate> {
-        val bank = BankDirectory.findIn(frameText)
-        val hasKeyword = KEYWORD.containsMatchIn(frameText)
-        val out = LinkedHashMap<String, NubanCandidate>()
+        var out: LinkedHashMap<String, NubanCandidate>? = null
+        var contextEvaluated = false
+        var bank: Bank? = null
+        var hasKeyword = false
 
         for (m in CANDIDATE.findAll(frameText)) {
             val raw = m.value
@@ -132,11 +191,21 @@ object NubanExtractor {
 
             val number = normalize(raw)
             if (number.length != 10 || !number.all(Char::isDigit)) continue
-            if (number.toSet().size <= 2) continue // 0000000000, 1212121212, ...
+            if (hasAtMostTwoDistinctChars(number)) continue // 0000000000, 1212121212, ...
 
-            classify(number, bank, hasKeyword)?.let { out.putIfAbsent(number, it) }
+            // Evaluate bank/keyword regexes only after at least one valid 10-digit candidate is found.
+            if (!contextEvaluated) {
+                bank = BankDirectory.findIn(frameText)
+                hasKeyword = KEYWORD.containsMatchIn(frameText)
+                contextEvaluated = true
+            }
+
+            classify(number, bank, hasKeyword)?.let { candidate ->
+                val map = out ?: LinkedHashMap<String, NubanCandidate>().also { out = it }
+                map.putIfAbsent(number, candidate)
+            }
         }
-        return out.values.toList()
+        return out?.values?.toList() ?: emptyList()
     }
 
     private fun classify(number: String, bank: Bank?, hasKeyword: Boolean): NubanCandidate? {
@@ -160,20 +229,40 @@ object NubanExtractor {
 
 /** Accepts a number only after it appears in `required` of the last `window` frames. */
 class FrameVoter(private val window: Int = 8, private val required: Int = 3) {
-    private val history = ArrayDeque<Map<String, NubanCandidate>>()
+    private val history = ArrayDeque<Map<String, NubanCandidate>>(window)
+    private val voteCounts = HashMap<String, Int>()
 
     fun submit(found: List<NubanCandidate>): NubanCandidate? {
-        history.addLast(found.associateBy { it.number })
-        if (history.size > window) history.removeFirst()
+        if (history.size == window) {
+            history.removeFirst()
+        }
+        history.addLast(if (found.isEmpty()) emptyMap() else found.associateBy { it.number })
 
-        val votes = history.flatMap { it.keys }.groupingBy { it }.eachCount()
-        val best = votes.filter { it.value >= required }
-            .maxByOrNull { it.value }?.key ?: return null
-        return history.lastOrNull { best in it }?.get(best)
+        voteCounts.clear()
+        for (frame in history) {
+            for (key in frame.keys) {
+                voteCounts[key] = (voteCounts[key] ?: 0) + 1
+            }
+        }
+
+        var bestKey: String? = null
+        var bestCount = required - 1
+        for ((key, count) in voteCounts) {
+            if (count > bestCount) {
+                bestCount = count
+                bestKey = key
+            }
+        }
+        val winner = bestKey ?: return null
+        for (i in history.lastIndex downTo 0) {
+            history[i][winner]?.let { return it }
+        }
+        return null
     }
 
     fun reset() {
         history.clear()
+        voteCounts.clear()
     }
 }
 
@@ -182,6 +271,7 @@ class FrameVoter(private val window: Int = 8, private val required: Int = 3) {
  * Combines single-frame NUBAN extraction, multi-frame consensus voting, and OCR block matching.
  */
 class NubanFilter(window: Int = 8, required: Int = 3) {
+    private val lock = Any()
     private val voter = FrameVoter(window = window, required = required)
 
     /** Processes full-frame OCR text and returns a candidate once it passes multi-frame voting. */
@@ -191,7 +281,9 @@ class NubanFilter(window: Int = 8, required: Int = 3) {
         } else {
             NubanExtractor.extract(frameText)
         }
-        return voter.submit(candidates)
+        return synchronized(lock) {
+            voter.submit(candidates)
+        }
     }
 
     /** Returns true if [blockText] contains the confirmed [candidate] account number. */
@@ -200,5 +292,9 @@ class NubanFilter(window: Int = 8, required: Int = 3) {
     }
 
     /** Clears accumulated frame votes when resetting or starting a new scan. */
-    fun reset() = voter.reset()
+    fun reset() {
+        synchronized(lock) {
+            voter.reset()
+        }
+    }
 }
