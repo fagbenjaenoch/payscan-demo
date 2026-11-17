@@ -23,7 +23,6 @@ import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
@@ -31,10 +30,10 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -48,16 +47,16 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -72,18 +71,21 @@ import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
-import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.milliseconds
 
 // ---------------------------------------------------------------------------
 // Tuning constants
 // ---------------------------------------------------------------------------
 
-/** Minimum gap between OCR runs. Saves battery and keeps the phone cool. */
-private const val ANALYSIS_INTERVAL_MS = 400L
+/** Minimum gap between OCR runs while actively searching for an account number. */
+private const val ACTIVE_ANALYSIS_INTERVAL_MS = 400L
+
+/** Slower polling interval once a HIGH-confidence NUBAN is locked to reduce thermal/battery load. */
+private const val LOCKED_ANALYSIS_INTERVAL_MS = 900L
 
 /** Clear live results if no text has been seen for this long. */
 private const val STALE_TEXT_MS = 1_500L
@@ -185,11 +187,15 @@ fun CameraFlashlightApp() {
 }
 
 // ---------------------------------------------------------------------------
-// OCR analyzer (delegates NUBAN filtering to NubanFilter)
+// OCR analyzer (delegates NUBAN filtering to NubanFilter on workerExecutor)
 // ---------------------------------------------------------------------------
 
 /** One recognized text block. [box] is in preview-view pixels, or null if it couldn't be mapped. */
-data class OcrBlock(val text: String, val box: Rect?)
+data class OcrBlock(
+    val text: String,
+    val box: Rect?,
+    val matchesNuban: Boolean = false
+)
 
 /** Combined frame output containing raw OCR blocks and any confirmed NUBAN candidate. */
 data class OcrScanResult(
@@ -200,9 +206,10 @@ data class OcrScanResult(
 class OcrAnalyzer(
     private val recognizer: TextRecognizer,
     private val nubanFilter: NubanFilter,
+    private val workerExecutor: Executor,
     private val isPaused: () -> Boolean,
+    private val isLocked: () -> Boolean,
     private val viewSize: () -> IntSize,
-    /** Always invoked on the main thread. */
     private val onResult: (OcrScanResult) -> Unit
 ) : ImageAnalysis.Analyzer {
 
@@ -216,10 +223,11 @@ class OcrAnalyzer(
     override fun analyze(imageProxy: ImageProxy) {
         val now = SystemClock.elapsedRealtime()
         val mediaImage = imageProxy.image
+        val minInterval = if (isLocked()) LOCKED_ANALYSIS_INTERVAL_MS else ACTIVE_ANALYSIS_INTERVAL_MS
 
         // Throttle, pause and shutdown checks. Always close the proxy or the stream freezes.
         if (released.get() || isPaused() || mediaImage == null ||
-            now - lastRunAt < ANALYSIS_INTERVAL_MS
+            now - lastRunAt < minInterval
         ) {
             imageProxy.close()
             return
@@ -234,7 +242,7 @@ class OcrAnalyzer(
 
         try {
             recognizer.process(image)
-                .addOnSuccessListener { visionText ->
+                .addOnSuccessListener(workerExecutor) { visionText ->
                     if (released.get()) return@addOnSuccessListener
                     val size = viewSize()
                     val confirmedNuban = nubanFilter.filter(visionText.text)
@@ -245,8 +253,11 @@ class OcrAnalyzer(
                         val block = textBlocks[i]
                         val text = block.text
                         if (text.isNotBlank()) {
+                            val trimmed = text.trim()
                             val box = block.boundingBox?.let { mapToView(it, imageW, imageH, size) }
-                            blocks.add(OcrBlock(text.trim(), box))
+                            val matchesNuban = confirmedNuban != null &&
+                                    nubanFilter.matchesBlock(trimmed, confirmedNuban)
+                            blocks.add(OcrBlock(trimmed, box, matchesNuban))
                         }
                     }
 
@@ -306,14 +317,6 @@ private fun buildImageAnalysis(): ImageAnalysis =
         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
         .build()
 
-private fun buildImageCapture(): ImageCapture =
-    ImageCapture.Builder()
-        .setResolutionSelector(
-            ResolutionSelector.Builder().setAspectRatioStrategy(aspectStrategy).build()
-        )
-        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-        .build()
-
 // ---------------------------------------------------------------------------
 // Main screen
 // ---------------------------------------------------------------------------
@@ -323,7 +326,6 @@ fun CameraWithTorchAndOcrScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val clipboard = LocalClipboard.current
-    val density = LocalDensity.current
     val scope = rememberCoroutineScope()
 
     val nubanFilter = remember { NubanFilter() }
@@ -350,7 +352,9 @@ fun CameraWithTorchAndOcrScreen() {
         val analyzer = OcrAnalyzer(
             recognizer = recognizer,
             nubanFilter = nubanFilter,
+            workerExecutor = executor,
             isPaused = { isFrozen },
+            isLocked = { detectedNuban?.confidence == Confidence.HIGH },
             viewSize = { previewSize },
             onResult = { result ->
                 if (!isFrozen) {
@@ -366,7 +370,6 @@ fun CameraWithTorchAndOcrScreen() {
             }
         )
         val imageAnalysis = buildImageAnalysis().also { it.setAnalyzer(executor, analyzer) }
-        val imageCapture = buildImageCapture()
 
         val providerFuture = ProcessCameraProvider.getInstance(context)
         var provider: ProcessCameraProvider? = null
@@ -381,8 +384,7 @@ fun CameraWithTorchAndOcrScreen() {
                 lifecycleOwner,
                 CameraSelector.DEFAULT_BACK_CAMERA,
                 buildPreview(previewView),
-                imageAnalysis,
-                imageCapture
+                imageAnalysis
             )
         }, ContextCompat.getMainExecutor(context))
 
@@ -441,7 +443,9 @@ fun CameraWithTorchAndOcrScreen() {
     }
 
     val selectedBlock = selectedIndex?.let { blocks.getOrNull(it) }
-    val displayText = selectedBlock?.text ?: blocks.joinToString("\n") { it.text }
+    val displayText = remember(selectedBlock, blocks) {
+        selectedBlock?.text ?: blocks.joinToString("\n") { it.text }
+    }
     val hasFlash = camera?.cameraInfo?.hasFlashUnit() == true
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -462,35 +466,48 @@ fun CameraWithTorchAndOcrScreen() {
             )
         }
 
-        // Bounding boxes; NUBAN-matching blocks highlight in green, tapped blocks in yellow.
-        blocks.forEachIndexed { index, block ->
-            val r = block.box ?: return@forEachIndexed
-            val selected = index == selectedIndex
-            val matchesNuban = detectedNuban?.let { nubanFilter.matchesBlock(block.text, it) } == true
-            val borderColor = when {
-                selected -> Color.Yellow
-                matchesNuban -> Color(0xFF00E676)
-                else -> Color.White.copy(alpha = 0.8f)
-            }
-            Box(
-                modifier = Modifier
-                    .offset { IntOffset(r.left.roundToInt(), r.top.roundToInt()) }
-                    .size(
-                        width = with(density) { r.width.toDp() },
-                        height = with(density) { r.height.toDp() }
-                    )
-                    .border(
-                        width = if (selected || matchesNuban) 3.dp else 1.5.dp,
-                        color = borderColor
-                    )
-                    .then(
-                        if (isFrozen) {
-                            Modifier.clickable { selectedIndex = if (selected) null else index }
-                        } else {
-                            Modifier
+        // Single-pass Canvas for bounding boxes; NUBAN-matching blocks highlight in green, tapped in yellow.
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .then(
+                    if (isFrozen) {
+                        Modifier.pointerInput(blocks) {
+                            detectTapGestures { tapOffset ->
+                                val hit = blocks.indexOfLast { it.box?.contains(tapOffset) == true }
+                                selectedIndex = when {
+                                    hit == -1 || hit == selectedIndex -> null
+                                    else -> hit
+                                }
+                            }
                         }
+                    } else {
+                        Modifier
+                    }
+                )
+        ) {
+            val selectedStroke = 3.dp.toPx()
+            val defaultStroke = 1.5.dp.toPx()
+            val defaultColor = Color.White.copy(alpha = 0.8f)
+            val nubanColor = Color(0xFF00E676)
+
+            blocks.forEachIndexed { index, block ->
+                val r = block.box ?: return@forEachIndexed
+                val selected = index == selectedIndex
+                val color = when {
+                    selected -> Color.Yellow
+                    block.matchesNuban -> nubanColor
+                    else -> defaultColor
+                }
+                drawRect(
+                    color = color,
+                    topLeft = r.topLeft,
+                    size = r.size,
+                    style = Stroke(
+                        width = if (selected || block.matchesNuban) selectedStroke else defaultStroke
                     )
-            )
+                )
+            }
         }
 
         // Bottom overlay: detected NUBAN card + raw OCR text + actions
