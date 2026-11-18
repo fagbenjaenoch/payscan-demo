@@ -34,6 +34,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -74,6 +75,7 @@ import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.Locale
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -472,7 +474,23 @@ fun CameraWithTorchAndOcrScreen() {
     }
     val hasFlash = camera?.cameraInfo?.hasFlashUnit() == true
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .then(
+                if (!isFrozen) {
+                    Modifier.pointerInput(camera, minZoomRatio, maxZoomRatio) {
+                        detectTransformGestures { _, _, zoomChange, _ ->
+                            if (!isFrozen) {
+                                zoomRatio = (zoomRatio * zoomChange).coerceIn(minZoomRatio, maxZoomRatio)
+                            }
+                        }
+                    }
+                } else {
+                    Modifier
+                }
+            )
+    ) {
         AndroidView(
             modifier = Modifier
                 .fillMaxSize()
@@ -582,6 +600,21 @@ fun CameraWithTorchAndOcrScreen() {
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                if (maxZoomRatio > 1f) {
+                    OutlinedButton(
+                        enabled = !isFrozen,
+                        onClick = {
+                            zoomRatio = if (zoomRatio < 1.8f) {
+                                2f.coerceAtMost(maxZoomRatio)
+                            } else {
+                                1f
+                            }
+                        }
+                    ) {
+                        Text(String.format(Locale.US, "%.1fx", zoomRatio))
+                    }
+                }
+
                 if (hasFlash) {
                     Button(onClick = { isTorchOn = !isTorchOn }) {
                         Text(if (isTorchOn) "Flash Off" else "Flash On")
