@@ -40,6 +40,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -60,9 +61,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.camera.core.ZoomState
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.Observer
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.mlkit.vision.common.InputImage
@@ -331,6 +334,9 @@ fun CameraWithTorchAndOcrScreen() {
     val nubanFilter = remember { NubanFilter() }
     var camera by remember { mutableStateOf<Camera?>(null) }
     var isTorchOn by rememberSaveable { mutableStateOf(false) }
+    var zoomRatio by rememberSaveable { mutableFloatStateOf(1f) }
+    var minZoomRatio by remember { mutableFloatStateOf(1f) }
+    var maxZoomRatio by remember { mutableFloatStateOf(1f) }
     var blocks by remember { mutableStateOf<List<OcrBlock>>(emptyList()) }
     var detectedNuban by remember { mutableStateOf<NubanCandidate?>(null) }
     var lastTextAt by remember { mutableLongStateOf(0L) }
@@ -403,6 +409,24 @@ fun CameraWithTorchAndOcrScreen() {
     LaunchedEffect(camera, isTorchOn) {
         camera?.takeIf { it.cameraInfo.hasFlashUnit() }
             ?.cameraControl?.enableTorch(isTorchOn)
+    }
+
+    DisposableEffect(camera, lifecycleOwner) {
+        val cam = camera
+        val observer = Observer<ZoomState> { state ->
+            minZoomRatio = state.minZoomRatio
+            maxZoomRatio = state.maxZoomRatio
+            zoomRatio = zoomRatio.coerceIn(minZoomRatio, maxZoomRatio)
+        }
+        cam?.cameraInfo?.zoomState?.observe(lifecycleOwner, observer)
+
+        onDispose {
+            cam?.cameraInfo?.zoomState?.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(camera, zoomRatio, minZoomRatio, maxZoomRatio) {
+        camera?.cameraControl?.setZoomRatio(zoomRatio.coerceIn(minZoomRatio, maxZoomRatio))
     }
 
     // Clear stale text and NUBAN votes after the camera points away.
