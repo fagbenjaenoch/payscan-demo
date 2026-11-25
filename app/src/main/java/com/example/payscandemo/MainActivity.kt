@@ -30,21 +30,34 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountBalance
+import androidx.compose.material.icons.filled.AcUnit
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.FlashOff
+import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
@@ -321,7 +334,6 @@ private fun buildImageAnalysis(): ImageAnalysis =
         )
         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
         .build()
-
 // ---------------------------------------------------------------------------
 // Main screen
 // ---------------------------------------------------------------------------
@@ -407,12 +419,6 @@ fun CameraWithTorchAndOcrScreen() {
         }
     }
 
-    // Torch: re-applied whenever the camera rebinds or the saved state changes.
-    LaunchedEffect(camera, isTorchOn) {
-        camera?.takeIf { it.cameraInfo.hasFlashUnit() }
-            ?.cameraControl?.enableTorch(isTorchOn)
-    }
-
     DisposableEffect(camera, lifecycleOwner) {
         val cam = camera
         val observer = Observer<ZoomState> { state ->
@@ -427,6 +433,13 @@ fun CameraWithTorchAndOcrScreen() {
         }
     }
 
+    // Torch: re-applied whenever the camera rebinds or the saved state changes.
+    LaunchedEffect(camera, isTorchOn) {
+        camera?.takeIf { it.cameraInfo.hasFlashUnit() }
+            ?.cameraControl?.enableTorch(isTorchOn)
+    }
+
+    // Re-apply zoom ratio on camera rebind or zoomRatio change
     LaunchedEffect(camera, zoomRatio, minZoomRatio, maxZoomRatio) {
         camera?.cameraControl?.setZoomRatio(zoomRatio.coerceIn(minZoomRatio, maxZoomRatio))
     }
@@ -477,6 +490,7 @@ fun CameraWithTorchAndOcrScreen() {
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .background(Color.Black)
             .then(
                 if (!isFrozen) {
                     Modifier.pointerInput(camera, minZoomRatio, maxZoomRatio) {
@@ -491,230 +505,393 @@ fun CameraWithTorchAndOcrScreen() {
                 }
             )
     ) {
-        AndroidView(
+        // Centered 4:3 Camera Feed Container (Restricted to middle portion of screen)
+        Box(
             modifier = Modifier
-                .fillMaxSize()
-                .onSizeChanged { previewSize = it },
-            factory = { previewView }
-        )
+                .align(Alignment.Center)
+                .fillMaxWidth(0.92f)
+                .aspectRatio(3f / 4f)
+                .clip(RoundedCornerShape(16.dp))
+                .background(Color.DarkGray)
+                .onSizeChanged { previewSize = it }
+        ) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { previewView }
+            )
 
-        // Frozen snapshot covers the live preview so boxes stay aligned with the image.
-        frozenFrame?.let { frame ->
-            Image(
-                bitmap = frame,
-                contentDescription = null,
-                contentScale = ContentScale.FillBounds,
-                modifier = Modifier.fillMaxSize()
+            // Frozen snapshot covers the camera feed
+            frozenFrame?.let { frame ->
+                Image(
+                    bitmap = frame,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+
+            // Viewfinder Scanner Guide Overlay
+            ViewfinderOverlay()
+
+            // Single-pass Canvas for bounding boxes inside the 4:3 viewport
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .then(
+                        if (isFrozen) {
+                            Modifier.pointerInput(blocks) {
+                                detectTapGestures { tapOffset ->
+                                    val hit = blocks.indexOfLast { it.box?.contains(tapOffset) == true }
+                                    selectedIndex = when {
+                                        hit == -1 || hit == selectedIndex -> null
+                                        else -> hit
+                                    }
+                                }
+                            }
+                        } else {
+                            Modifier
+                        }
+                    )
+            ) {
+                val selectedStroke = 3.dp.toPx()
+                val defaultStroke = 1.5.dp.toPx()
+                val defaultColor = Color.White.copy(alpha = 0.8f)
+                val nubanColor = Color(0xFF00E676)
+
+                blocks.forEachIndexed { index, block ->
+                    val r = block.box ?: return@forEachIndexed
+                    val selected = index == selectedIndex
+                    val color = when {
+                        selected -> Color.Yellow
+                        block.matchesNuban -> nubanColor
+                        else -> defaultColor
+                    }
+                    drawRect(
+                        color = color,
+                        topLeft = r.topLeft,
+                        size = r.size,
+                        style = Stroke(
+                            width = if (selected || block.matchesNuban) selectedStroke else defaultStroke
+                        )
+                    )
+                }
+            }
+        }
+
+        // Top Floating Bar (Flash, Pause/Freeze, Zoom, Copy)
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(top = 16.dp)
+        ) {
+            TopFloatingBar(
+                isTorchOn = isTorchOn,
+                hasFlash = hasFlash,
+                isFrozen = isFrozen,
+                zoomRatio = zoomRatio,
+                maxZoomRatio = maxZoomRatio,
+                onToggleFlash = { isTorchOn = !isTorchOn },
+                onToggleFreeze = { toggleFreeze() },
+                onToggleZoom = {
+                    zoomRatio = if (zoomRatio < 1.8f) {
+                        2f.coerceAtMost(maxZoomRatio)
+                    } else {
+                        1f
+                    }
+                },
+                onCopyAll = { copyText("Recognized text", displayText) },
+                hasText = displayText.isNotEmpty()
             )
         }
 
-        // Single-pass Canvas for bounding boxes; NUBAN-matching blocks highlight in green, tapped in yellow.
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .then(
-                    if (isFrozen) {
-                        Modifier.pointerInput(blocks) {
-                            detectTapGestures { tapOffset ->
-                                val hit = blocks.indexOfLast { it.box?.contains(tapOffset) == true }
-                                selectedIndex = when {
-                                    hit == -1 || hit == selectedIndex -> null
-                                    else -> hit
-                                }
-                            }
-                        }
-                    } else {
-                        Modifier
-                    }
-                )
-        ) {
-            val selectedStroke = 3.dp.toPx()
-            val defaultStroke = 1.5.dp.toPx()
-            val defaultColor = Color.White.copy(alpha = 0.8f)
-            val nubanColor = Color(0xFF00E676)
-
-            blocks.forEachIndexed { index, block ->
-                val r = block.box ?: return@forEachIndexed
-                val selected = index == selectedIndex
-                val color = when {
-                    selected -> Color.Yellow
-                    block.matchesNuban -> nubanColor
-                    else -> defaultColor
-                }
-                drawRect(
-                    color = color,
-                    topLeft = r.topLeft,
-                    size = r.size,
-                    style = Stroke(
-                        width = if (selected || block.matchesNuban) selectedStroke else defaultStroke
-                    )
-                )
-            }
-        }
-
-        // Bottom overlay: detected NUBAN card + raw OCR text + actions
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .navigationBarsPadding()
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            detectedNuban?.let { candidate ->
+        // Bottom overlay: Bank details card displayed ONLY when an account number has been identified
+        detectedNuban?.let { candidate ->
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(20.dp)
+            ) {
                 NubanResultCard(
                     candidate = candidate,
-                    onCopyAccount = { copyText("NUBAN account number", it) }
-                )
-            }
-
-            Surface(
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
-                shape = MaterialTheme.shapes.medium,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = if (detectedNuban != null) 110.dp else 150.dp)
-            ) {
-                Text(
-                    text = when {
-                        displayText.isNotEmpty() -> displayText
-                        else -> "Point the camera at a bank account or text"
-                    },
-                    modifier = Modifier
-                        .padding(12.dp)
-                        .verticalScroll(rememberScrollState()),
-                    style = MaterialTheme.typography.bodyMedium
-                )
-            }
-
-            if (isFrozen) {
-                Text(
-                    text = "Tap a box to copy just that block",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Color.White
-                )
-            }
-
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                if (maxZoomRatio > 1f) {
-                    OutlinedButton(
-                        enabled = !isFrozen,
-                        onClick = {
-                            zoomRatio = if (zoomRatio < 1.8f) {
-                                2f.coerceAtMost(maxZoomRatio)
-                            } else {
-                                1f
-                            }
-                        }
-                    ) {
-                        Text(String.format(Locale.US, "%.1fx", zoomRatio))
+                    onCopyAccount = { copyText("NUBAN account number", it) },
+                    onVerify = { accountNum ->
+                        Toast.makeText(context, "Verifying $accountNum...", Toast.LENGTH_SHORT).show()
                     }
-                }
-
-                if (hasFlash) {
-                    Button(onClick = { isTorchOn = !isTorchOn }) {
-                        Text(if (isTorchOn) "Flash Off" else "Flash On")
-                    }
-                }
-
-                Button(
-                    enabled = isFrozen || blocks.isNotEmpty() || detectedNuban != null,
-                    onClick = { toggleFreeze() }
-                ) {
-                    Text(if (isFrozen) "Resume" else "Freeze")
-                }
-
-                Button(
-                    enabled = displayText.isNotEmpty(),
-                    onClick = { copyText("Recognized text", displayText) }
-                ) {
-                    Text(if (selectedBlock != null) "Copy Block" else "Copy All")
-                }
+                )
             }
         }
     }
 }
 
 @Composable
-private fun NubanResultCard(
-    candidate: NubanCandidate,
-    onCopyAccount: (String) -> Unit
+private fun TopFloatingBar(
+    isTorchOn: Boolean,
+    hasFlash: Boolean,
+    isFrozen: Boolean,
+    zoomRatio: Float,
+    maxZoomRatio: Float,
+    onToggleFlash: () -> Unit,
+    onToggleFreeze: () -> Unit,
+    onToggleZoom: () -> Unit,
+    onCopyAll: () -> Unit,
+    hasText: Boolean
 ) {
-    val (badgeBg, badgeFg) = when (candidate.confidence) {
-        Confidence.HIGH -> Color(0xFF1B5E20) to Color(0xFFA5D6A7)
-        Confidence.MEDIUM -> Color(0xFFE65100) to Color(0xFFFFCC80)
-        Confidence.LOW -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
-    }
-
     Surface(
-        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.95f),
-        shape = MaterialTheme.shapes.medium,
-        tonalElevation = 4.dp,
-        modifier = Modifier.fillMaxWidth()
+        color = Color(0xFF1E1E22).copy(alpha = 0.95f),
+        shape = RoundedCornerShape(50.dp),
+        tonalElevation = 8.dp,
+        modifier = Modifier.wrapContentSize()
     ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = candidate.bank?.let { "${it.name} (${it.code})" } ?: "Bank not detected",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                    modifier = Modifier.weight(1f)
-                )
-                Text(
-                    text = "${candidate.confidence.name} CONFIDENCE",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = badgeFg,
-                    modifier = Modifier
-                        .background(badgeBg, RoundedCornerShape(4.dp))
-                        .padding(horizontal = 6.dp, vertical = 2.dp)
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = candidate.number,
-                    style = MaterialTheme.typography.headlineSmall.copy(
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold
-                    ),
-                    color = MaterialTheme.colorScheme.onSecondaryContainer
-                )
-                Button(onClick = { onCopyAccount(candidate.number) }) {
-                    Text("Copy NUBAN")
+            // 1. Flash Icon Button (Lightning bolt)
+            if (hasFlash) {
+                IconButton(onClick = onToggleFlash) {
+                    Icon(
+                        imageVector = if (isTorchOn) Icons.Filled.FlashOn else Icons.Filled.FlashOff,
+                        contentDescription = "Flash",
+                        tint = if (isTorchOn) Color(0xFFFFD600) else Color.White
+                    )
                 }
             }
 
-            candidate.suggestedFix?.let { fix ->
+            // 2. Freeze / Unfreeze White Pill Button (Pause icon + Snowflake icon side-by-side)
+            Surface(
+                color = Color.White,
+                shape = RoundedCornerShape(50.dp),
+                modifier = Modifier
+                    .clickable(onClick = onToggleFreeze)
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+            ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = if (isFrozen) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                        contentDescription = "Pause",
+                        tint = Color.Black,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Icon(
+                        imageVector = Icons.Filled.AcUnit,
+                        contentDescription = "Freeze Snowflake",
+                        tint = if (isFrozen) Color(0xFF007AFF) else Color.Black,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+
+            // 3. Zoom Pill Button (1.0x)
+            if (maxZoomRatio > 1f) {
+                Surface(
+                    color = Color(0xFF333338),
+                    shape = RoundedCornerShape(50.dp),
+                    modifier = Modifier
+                        .clickable(enabled = !isFrozen, onClick = onToggleZoom)
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
                 ) {
                     Text(
-                        text = "Possible OCR typo → $fix",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer,
-                        modifier = Modifier.weight(1f)
+                        text = String.format(Locale.US, "%.1fx", zoomRatio),
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                        color = Color.White
                     )
-                    OutlinedButton(onClick = { onCopyAccount(fix) }) {
-                        Text("Copy Fix")
+                }
+            }
+
+            // 4. Copy Icon Button (Overlapping pages / ContentCopy)
+            IconButton(
+                enabled = hasText,
+                onClick = onCopyAll
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.ContentCopy,
+                    contentDescription = "Copy All Text",
+                    tint = if (hasText) Color.White else Color(0xFF71717A)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ViewfinderOverlay() {
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val width = size.width
+        val height = size.height
+        val boxWidth = width * 0.9f
+        val boxHeight = height * 0.85f
+        val left = (width - boxWidth) / 2f
+        val top = (height - boxHeight) / 2f
+        val right = left + boxWidth
+        val bottom = top + boxHeight
+        val cornerLength = 28.dp.toPx()
+        val strokeWidth = 3.5.dp.toPx()
+        val color = Color.White.copy(alpha = 0.85f)
+
+        // Top-Left corner
+        drawLine(color, androidx.compose.ui.geometry.Offset(left, top), androidx.compose.ui.geometry.Offset(left + cornerLength, top), strokeWidth)
+        drawLine(color, androidx.compose.ui.geometry.Offset(left, top), androidx.compose.ui.geometry.Offset(left, top + cornerLength), strokeWidth)
+
+        // Top-Right corner
+        drawLine(color, androidx.compose.ui.geometry.Offset(right, top), androidx.compose.ui.geometry.Offset(right - cornerLength, top), strokeWidth)
+        drawLine(color, androidx.compose.ui.geometry.Offset(right, top), androidx.compose.ui.geometry.Offset(right, top + cornerLength), strokeWidth)
+
+        // Bottom-Left corner
+        drawLine(color, androidx.compose.ui.geometry.Offset(left, bottom), androidx.compose.ui.geometry.Offset(left + cornerLength, bottom), strokeWidth)
+        drawLine(color, androidx.compose.ui.geometry.Offset(left, bottom), androidx.compose.ui.geometry.Offset(left, bottom - cornerLength), strokeWidth)
+
+        // Bottom-Right corner
+        drawLine(color, androidx.compose.ui.geometry.Offset(right, bottom), androidx.compose.ui.geometry.Offset(right - cornerLength, bottom), strokeWidth)
+        drawLine(color, androidx.compose.ui.geometry.Offset(right, bottom), androidx.compose.ui.geometry.Offset(right, bottom - cornerLength), strokeWidth)
+    }
+}
+
+@Composable
+private fun NubanResultCard(
+    candidate: NubanCandidate,
+    onCopyAccount: (String) -> Unit,
+    onVerify: (String) -> Unit
+) {
+    Surface(
+        color = Color(0xFF1C1C1E),
+        shape = RoundedCornerShape(32.dp),
+        tonalElevation = 12.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            // 1. Header Row: Status Circle Dot + "BANK DETECTED •" + MoreVert Icon
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .background(
+                                color = when (candidate.confidence) {
+                                    Confidence.HIGH -> Color(0xFF00E676)
+                                    Confidence.MEDIUM -> Color(0xFFFFAB40)
+                                    Confidence.LOW -> Color(0xFFFF5252)
+                                },
+                                shape = RoundedCornerShape(50)
+                            )
+                    )
+                    Text(
+                        text = "BANK DETECTED  •",
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 1.2.sp
+                        ),
+                        color = Color(0xFFA1A1AA)
+                    )
+                }
+
+                IconButton(
+                    onClick = { /* More actions for detected bank details */ },
+                    modifier = Modifier.size(24.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.MoreVert,
+                        contentDescription = "More Actions",
+                        tint = Color(0xFFA1A1AA)
+                    )
+                }
+            }
+
+            // 2. Large Bold Monospace Account Number
+            Text(
+                text = candidate.number,
+                style = MaterialTheme.typography.displayMedium.copy(
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 2.sp
+                ),
+                color = Color.White
+            )
+
+            // 3. Bank Name Row: Building Icon in circular badge + "ZENITH BANK"
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Surface(
+                    color = Color(0xFF2C2C32),
+                    shape = RoundedCornerShape(50),
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Filled.AccountBalance,
+                            contentDescription = "Bank Icon",
+                            tint = Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
                     }
+                }
+                Text(
+                    text = candidate.bank?.let { it.name.uppercase() } ?: "UNKNOWN BANK",
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontWeight = FontWeight.SemiBold,
+                        letterSpacing = 0.8.sp
+                    ),
+                    color = Color(0xFFE4E4E7)
+                )
+            }
+
+            Spacer(Modifier.height(4.dp))
+
+            // 4. Action Buttons Row: "Copy Number" & "Verify"
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Button(
+                    onClick = { onCopyAccount(candidate.number) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFE4E4E8),
+                        contentColor = Color(0xFF111113)
+                    ),
+                    shape = RoundedCornerShape(50.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                ) {
+                    Text(
+                        text = "Copy Number",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = { onVerify(candidate.number) },
+                    border = BorderStroke(1.dp, Color(0xFF55555A)),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(50.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                ) {
+                    Text(
+                        text = "Verify",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                    )
                 }
             }
         }
