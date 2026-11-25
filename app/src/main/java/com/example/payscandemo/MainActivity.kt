@@ -791,10 +791,11 @@ private fun NubanResultCard(
                             )
                     )
                     Text(
-                        text = "BANK DETECTED  •",
+                        text = "BANK DETECTED",
                         style = MaterialTheme.typography.labelLarge.copy(
                             fontWeight = FontWeight.Bold,
-                            letterSpacing = 1.2.sp
+                            letterSpacing = 1.2.sp,
+                            fontSize = 12.sp
                         ),
                         color = Color(0xFFA1A1AA)
                     )
@@ -823,7 +824,6 @@ private fun NubanResultCard(
                 color = Color.White
             )
 
-            // 3. Bank Name Row: Building Icon in circular badge + "ZENITH BANK"
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -854,7 +854,6 @@ private fun NubanResultCard(
 
             Spacer(Modifier.height(4.dp))
 
-            // 4. Action Buttons Row: "Copy Number" & "Verify"
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(14.dp)
@@ -872,23 +871,6 @@ private fun NubanResultCard(
                 ) {
                     Text(
                         text = "Copy Number",
-                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
-                    )
-                }
-
-                OutlinedButton(
-                    onClick = { onVerify(candidate.number) },
-                    border = BorderStroke(1.dp, Color(0xFF55555A)),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = Color.White
-                    ),
-                    shape = RoundedCornerShape(50.dp),
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(48.dp)
-                ) {
-                    Text(
-                        text = "Verify",
                         style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
                     )
                 }
