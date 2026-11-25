@@ -509,8 +509,7 @@ fun CameraWithTorchAndOcrScreen() {
         Box(
             modifier = Modifier
                 .align(Alignment.Center)
-                .fillMaxWidth(0.92f)
-                .aspectRatio(3f / 4f)
+                .aspectRatio(4f / 3f)
                 .clip(RoundedCornerShape(16.dp))
                 .background(Color.DarkGray)
                 .onSizeChanged { previewSize = it }
