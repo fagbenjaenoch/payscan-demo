@@ -108,6 +108,15 @@ private const val LOCKED_ANALYSIS_INTERVAL_MS = 900L
 /** Clear live results if no text has been seen for this long. */
 private const val STALE_TEXT_MS = 1_500L
 
+/** Handwriting frames skip ML Kit and are cheap, so they can be read more often. */
+private const val HANDWRITING_ANALYSIS_INTERVAL_MS = 250L
+
+/** The writing band, as fractions of the preview box. The analyzer and the overlay both use it. */
+private const val BAND_LEFT = 0.05f
+private const val BAND_RIGHT = 0.95f
+private const val BAND_TOP = 0.40f
+private const val BAND_BOTTOM = 0.60f
+
 /** Target analysis resolution. Higher than CameraX's 640x480 default so small print is readable. */
 private val ANALYSIS_SIZE = Size(1280, 720)
 
@@ -225,23 +234,44 @@ class OcrAnalyzer(
     private val recognizer: TextRecognizer,
     private val nubanFilter: NubanFilter,
     private val workerExecutor: Executor,
+    private val appContext: Context,
     private val isPaused: () -> Boolean,
     private val isLocked: () -> Boolean,
+    private val isHandwriting: () -> Boolean,
     private val viewSize: () -> IntSize,
+    private val onHandwritingUnavailable: (String) -> Unit,
     private val onResult: (OcrScanResult) -> Unit
 ) : ImageAnalysis.Analyzer {
 
     private val released = AtomicBoolean(false)
     private var lastRunAt = 0L
 
+    // Handwriting pipeline. Created lazily and used ONLY on the analyzer thread (LiteRT needs that).
+    private var digitModel: LiteRtDigitModel? = null
+    private var handwritingReader: HandwritingReader? = null
+    private var wasHandwriting = false
+    private var modelFailed = false
+
     /** Call before closing the recognizer so late frames/results are ignored safely. */
     fun release() = released.set(true)
+
+    /** Run this on the analyzer executor, after [release], so it cannot overlap a frame. */
+    fun closeModel() {
+        handwritingReader = null
+        digitModel?.close()
+        digitModel = null
+    }
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
         val now = SystemClock.elapsedRealtime()
         val mediaImage = imageProxy.image
-        val minInterval = if (isLocked()) LOCKED_ANALYSIS_INTERVAL_MS else ACTIVE_ANALYSIS_INTERVAL_MS
+        val handwriting = isHandwriting()
+        val minInterval = when {
+            handwriting -> HANDWRITING_ANALYSIS_INTERVAL_MS
+            isLocked() -> LOCKED_ANALYSIS_INTERVAL_MS
+            else -> ACTIVE_ANALYSIS_INTERVAL_MS
+        }
 
         // Throttle, pause and shutdown checks. Always close the proxy or the stream freezes.
         if (released.get() || isPaused() || mediaImage == null ||
@@ -251,6 +281,16 @@ class OcrAnalyzer(
             return
         }
         lastRunAt = now
+
+        if (handwriting != wasHandwriting) {      // mode just changed: start both pipelines fresh
+            wasHandwriting = handwriting
+            handwritingReader?.reset()
+            modelFailed = false
+        }
+        if (handwriting) {
+            analyzeHandwriting(imageProxy)
+            return
+        }
 
         val rotation = imageProxy.imageInfo.rotationDegrees
         val upright = rotation % 180 == 0
@@ -286,6 +326,45 @@ class OcrAnalyzer(
                 .addOnCompleteListener { imageProxy.close() }
         } catch (_: Exception) {
             // Recognizer already closed or similar: never leak the frame.
+            imageProxy.close()
+        }
+    }
+
+    /** Handwriting path: Y plane -> writing band strip -> digits -> number. Always closes [imageProxy]. */
+    private fun analyzeHandwriting(imageProxy: ImageProxy) {
+        try {
+            if (modelFailed) return
+            val size = viewSize()
+            if (size.width == 0 || size.height == 0) return
+
+            val reader = handwritingReader ?: try {
+                HandwritingReader(LiteRtDigitModel(appContext).also { digitModel = it })
+                    .also { handwritingReader = it }
+            } catch (e: Throwable) {
+                modelFailed = true
+                onHandwritingUnavailable("Handwriting model could not be loaded: ${e.message}")
+                return
+            }
+
+            val plane = imageProxy.planes[0]
+            val roi = RoiRect(
+                size.width * BAND_LEFT, size.height * BAND_TOP,
+                size.width * BAND_RIGHT, size.height * BAND_BOTTOM
+            )
+            val strip = StripExtractor.extract(
+                plane.buffer, plane.rowStride, plane.pixelStride,
+                imageProxy.width, imageProxy.height, imageProxy.imageInfo.rotationDegrees,
+                size.width, size.height, roi
+            ) ?: return
+
+            val result = reader.read(strip)
+            val candidate = result.candidate
+            if (result.status == ReadStatus.OK && candidate != null && !released.get()) {
+                onResult(OcrScanResult(emptyList(), candidate))
+            }
+        } catch (_: Exception) {
+            // A bad frame must never crash the analyzer.
+        } finally {
             imageProxy.close()
         }
     }
@@ -358,6 +437,7 @@ fun CameraWithTorchAndOcrScreen() {
     var frozenFrame by remember { mutableStateOf<ImageBitmap?>(null) }
     var selectedIndex by remember { mutableStateOf<Int?>(null) }
     var previewSize by remember { mutableStateOf(IntSize.Zero) }
+    var handwritingMode by rememberSaveable { mutableStateOf(false) }
 
     val previewView = remember {
         PreviewView(context).apply {
@@ -373,9 +453,18 @@ fun CameraWithTorchAndOcrScreen() {
             recognizer = recognizer,
             nubanFilter = nubanFilter,
             workerExecutor = executor,
+            appContext = context.applicationContext,
             isPaused = { isFrozen },
             isLocked = { detectedNuban?.confidence == Confidence.HIGH },
+            isHandwriting = { handwritingMode },
             viewSize = { previewSize },
+            onHandwritingUnavailable = { message ->
+                ContextCompat.getMainExecutor(context).execute {
+                    handwritingMode = false
+                    detectedNuban = null
+                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                }
+            },
             onResult = { result ->
                 if (!isFrozen) {
                     if (result.blocks.isNotEmpty()) {
@@ -413,6 +502,7 @@ fun CameraWithTorchAndOcrScreen() {
             analyzer.release()
             imageAnalysis.clearAnalyzer()
             provider?.unbindAll()
+            executor.execute { analyzer.closeModel() }   // queued behind any running frame
             executor.shutdown()
             recognizer.close()
             camera = null
@@ -470,6 +560,14 @@ fun CameraWithTorchAndOcrScreen() {
             frozenFrame = previewView.bitmap?.asImageBitmap()
             isFrozen = true
         }
+    }
+
+    fun toggleHandwriting() {
+        handwritingMode = !handwritingMode
+        selectedIndex = null
+        blocks = emptyList()
+        detectedNuban = null
+        nubanFilter.reset()
     }
 
     fun copyText(label: String, text: String) {
@@ -530,7 +628,21 @@ fun CameraWithTorchAndOcrScreen() {
             }
 
             // Viewfinder Scanner Guide Overlay
-            ViewfinderOverlay()
+            if (handwritingMode) {
+                HandwritingBandOverlay()
+                if (detectedNuban == null) {
+                    Text(
+                        text = "Write the number inside the box",
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 12.dp)
+                    )
+                }
+            } else {
+                ViewfinderOverlay()
+            }
 
             // Single-pass Canvas for bounding boxes inside the 4:3 viewport
             Canvas(
@@ -588,8 +700,10 @@ fun CameraWithTorchAndOcrScreen() {
                 isTorchOn = isTorchOn,
                 hasFlash = hasFlash,
                 isFrozen = isFrozen,
+                isHandwriting = handwritingMode,
                 zoomRatio = zoomRatio,
                 maxZoomRatio = maxZoomRatio,
+                onToggleHandwriting = { toggleHandwriting() },
                 onToggleFlash = { isTorchOn = !isTorchOn },
                 onToggleFreeze = { toggleFreeze() },
                 onToggleZoom = {
@@ -630,8 +744,10 @@ private fun TopFloatingBar(
     isTorchOn: Boolean,
     hasFlash: Boolean,
     isFrozen: Boolean,
+    isHandwriting: Boolean,
     zoomRatio: Float,
     maxZoomRatio: Float,
+    onToggleHandwriting: () -> Unit,
     onToggleFlash: () -> Unit,
     onToggleFreeze: () -> Unit,
     onToggleZoom: () -> Unit,
@@ -685,6 +801,21 @@ private fun TopFloatingBar(
                         modifier = Modifier.size(18.dp)
                     )
                 }
+            }
+
+            // 2b. Printed / handwriting mode
+            Surface(
+                color = if (isHandwriting) Color(0xFF007AFF) else Color(0xFF333338),
+                shape = RoundedCornerShape(50.dp),
+                modifier = Modifier
+                    .clickable(enabled = !isFrozen, onClick = onToggleHandwriting)
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text = if (isHandwriting) "Pen" else "Print",
+                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                    color = Color.White
+                )
             }
 
             // 3. Zoom Pill Button (1.0x)
@@ -752,6 +883,23 @@ private fun ViewfinderOverlay() {
     }
 }
 
+/** The strip where handwriting is read: same fractions the analyzer cuts out of the frame. */
+@Composable
+private fun HandwritingBandOverlay() {
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val left = size.width * BAND_LEFT
+        val right = size.width * BAND_RIGHT
+        val top = size.height * BAND_TOP
+        val bottom = size.height * BAND_BOTTOM
+        drawRect(
+            color = Color.White.copy(alpha = 0.9f),
+            topLeft = androidx.compose.ui.geometry.Offset(left, top),
+            size = androidx.compose.ui.geometry.Size(right - left, bottom - top),
+            style = Stroke(width = 3.dp.toPx())
+        )
+    }
+}
+
 @Composable
 private fun NubanResultCard(
     candidate: NubanCandidate,
@@ -791,7 +939,7 @@ private fun NubanResultCard(
                             )
                     )
                     Text(
-                        text = "BANK DETECTED",
+                        text = if (candidate.kind == Kind.WALLET) "WALLET DETECTED" else "BANK DETECTED",
                         style = MaterialTheme.typography.labelLarge.copy(
                             fontWeight = FontWeight.Bold,
                             letterSpacing = 1.2.sp,
@@ -843,12 +991,23 @@ private fun NubanResultCard(
                     }
                 }
                 Text(
-                    text = candidate.bank?.let { it.name.uppercase() } ?: "UNKNOWN BANK",
+                    text = candidate.bank?.name?.uppercase()
+                        ?: candidate.fintech?.name?.uppercase()
+                        ?: if (candidate.kind == Kind.WALLET) "MOBILE WALLET" else "UNKNOWN BANK",
                     style = MaterialTheme.typography.titleMedium.copy(
                         fontWeight = FontWeight.SemiBold,
                         letterSpacing = 0.8.sp
                     ),
                     color = Color(0xFFE4E4E7)
+                )
+            }
+
+            candidate.suggestedFix?.let { fix ->
+                Text(
+                    text = "Possible correction: $fix (tap to copy)",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFFFFAB40),
+                    modifier = Modifier.clickable { onCopyAccount(fix) }
                 )
             }
 
@@ -877,4 +1036,4 @@ private fun NubanResultCard(
             }
         }
     }
-}
+}
