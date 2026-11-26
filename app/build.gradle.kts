@@ -34,6 +34,8 @@ android {
     buildFeatures {
         compose = true
     }
+
+    androidResources { noCompress += "tflite" }
 }
 
 dependencies {
@@ -58,4 +60,5 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
     implementation(libs.google.mlkit.text)
+    implementation("com.google.ai.edge.litert:litert:2.3.0")
 }
